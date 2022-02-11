@@ -3,24 +3,22 @@ const decoder = new InputDataDecoder(`${__dirname}/abi.json`);
 const axios = require("axios");
 const Datastore = require("nedb"), db = new Datastore({ filename: 'tx.db', autoload: true });
 
+function sleep(ms) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
 
 var BSC_API = "QH7GXPW1MSN3N4TUPT9E4FN4IKJS4817KE";
 var ADDRESS = "0x5aF6D33DE2ccEC94efb1bDF8f92Bd58085432d2c"; //PancakeSwap Contract
 
-const PAGE = 1;
-const OFFSET = 32;
-const SORT = "asc"; //asc | desc
+var LAST_BLOCK;
+var HAVE_START = false;
+const SORT = "desc"
 
-var START_BLOCK = 15102655n;
-var END_BLOCK = 99999999n;
-
-
-
-
-
-async function getTXs(sblock, eblock) {
+async function getLastTXs() {
     return axios
-        .get("https://api.bscscan.com/api?module=account&action=txlist&address=" + ADDRESS + "&startblock=" + sblock + "&endblock=" + eblock + "&page=" + PAGE + "&offset=" + OFFSET + "&sort=" + SORT + "&apikey=" + BSC_API)
+        .get("https://api.bscscan.com/api?module=account&action=txlist&address=" + ADDRESS + "&sort=" + SORT + "&apikey=" + BSC_API)
         .then(res => {
             return res.data;
         })
@@ -29,10 +27,71 @@ async function getTXs(sblock, eblock) {
         })
 }
 
-function checkIfEmpty() {
+async function getLastTXsFrom(blockid) {
+    return axios
+        .get("https://api.bscscan.com/api?module=account&action=txlist&address=" + ADDRESS + "&startblock=" + blockid + "&sort=" + SORT + "&apikey=" + BSC_API)
+        .then(res => {
+            return res.data;
+        })
+        .catch(error => {
+            console.log(error);
+        })
+}
+
+async function updateDB() {
+    var finished_lottery = false;
+    var filtered_txs = [];
+    var txs = (await getLastTXsFrom(LAST_BLOCK)).result;
+
+    txs.pop(); // This is the last tx which is in db
+    if(txs.length == 0) {
+        console.log("[+] updateDB: No new txs found!");
+    } else {
+        console.log("[+] updateDB: Update db with: " + txs.length + " new txs.");
+        for(var i = 0; i < txs.length; i++) {
+            var element = txs[i];
+
+            element.input = decoder.decodeData(element.input);
+
+            if(element.input.method != "startLottery") {
+                if(element.input.method != "claimTickets") {
+                    filtered_txs.push(element);
+                }
+            } else {
+                finished_lottery = true;
+                break;
+            }
+        }
+    }
+
+    if(finished_lottery == true) {
+        return;
+    } else {
+        sleep(5000)
+        updateDB();
+    }
+}
+
+async function initDB() {
+    var filtered_txs = [];
+    var last_txs = (await getLastTXs()).result;
+    for(var i = 0; i < last_txs.length; i++) {
+        var element = last_txs[i];
+
+        element.input = decoder.decodeData(element.input);
+
+        if(element.input.method == "buyTickets") {
+            filtered_txs.push(element);
+        } else if (element.input.method == "startLottery") {
+            filtered_txs.push(element);
+            HAVE_START = true;
+            break;
+        }
+    };
+    LAST_BLOCK = filtered_txs[0].blockNumber;
     return new Promise((res, rej) => {
-        db.find({}, (err, docs) => {
-            if (docs.length == 0) {
+        db.insert(filtered_txs, (err, docs) => {
+            if(docs.length == 0) {
                 res(true);
             } else {
                 res(false);
@@ -41,45 +100,14 @@ function checkIfEmpty() {
     })
 }
 
-async function populateDB(sblock, eblock) {
-    var txs = await getTXs(sblock, eblock);
-    var exp_len = 32
-    if (await checkIfEmpty() == false) {
-        txs.result.shift();
-        exp_len = 31;
-    }
-
-    txs.result.forEach((e, i) => {
-        var data = decoder.decodeData(e.input);
-        txs.result[i].input = data;
-        txs.result[i].method = data.method;
-    });
-
-    if (txs.result.length == 0) {
-        console.log("[+] No new tx. Waiting 15 sec")
-    } else {
-        console.log("[+] Found " + txs.result.length + " new tx(s)!");
-        console.log("[+] Adding to db.");
-        db.insert(txs.result, (err, newTxs) => {
-            var new_sblock = newTxs[newTxs.length - 1].blockNumber;
-            if (newTxs.length == exp_len) {
-                return populateDB(new_sblock, eblock);
-            } else {
-                START_BLOCK = new_sblock;
-                return 0;
-            }
-        })
-    }
-}
-
 async function main() {
-    if (await checkIfEmpty() == false) {
-        db.find({}).sort({ timeStamp: -1 }).limit(1).exec((err, data) => {
-            START_BLOCK = data.blockNumber;
-        })
+    await initDB();
+    if(HAVE_START == false) {
+        console.log("[!] WIP, didn't get the startLottery from last 10000 records!");
+        return;
     }
-    await populateDB(START_BLOCK, END_BLOCK);
-    const INTERV = setInterval(populateDB, 15000, [START_BLOCK, END_BLOCK]);
+
+    updateDB();
 }
 
 main();
